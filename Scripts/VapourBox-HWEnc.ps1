@@ -1,269 +1,163 @@
-# VapourBox HWEnc — lightweight PowerShell edition
-# Windows PowerShell 5.1+; requires WPF and rigaya NVEncC for Windows.
-# Preview is a user-loaded still-image comparison; encoding is performed by NVEncC.
+import 'dart:async';
+import 'dart:io';
 
-Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Windows.Forms
+import 'package:file_picker/file_picker.dart';
+import 'package:flutter/material.dart';
 
-$Script:Root = Split-Path -Parent $MyInvocation.MyCommand.Path
-$Script:Process = $null
-$Script:PollTimer = $null
-$Script:StdoutPath = Join-Path $env:TEMP ("vapourbox-hwenc-{0}.out" -f [guid]::NewGuid())
-$Script:StderrPath = Join-Path $env:TEMP ("vapourbox-hwenc-{0}.err" -f [guid]::NewGuid())
-$Script:ReadOut = 0L
-$Script:ReadErr = 0L
-$Script:Closing = $false
+void main() => runApp(const HwEncApp());
 
-function Resolve-NVEncC {
-    $local = Join-Path $Script:Root 'NVEncC64.exe'
-    if (Test-Path -LiteralPath $local) { return $local }
-    $found = Get-Command 'NVEncC64.exe' -ErrorAction SilentlyContinue
-    if ($found) { return $found.Source }
-    return 'NVEncC64.exe'
+const _background = Color(0xFF17191E);
+const _panel = Color(0xFF202329);
+const _line = Color(0xFF343842);
+const _accent = Color(0xFF8978E8);
+
+class HwEncApp extends StatelessWidget {
+  const HwEncApp({super.key});
+  @override
+  Widget build(BuildContext context) => MaterialApp(
+        title: 'VPPBox',
+        debugShowCheckedModeBanner: false,
+        theme: ThemeData(
+          brightness: Brightness.dark,
+          scaffoldBackgroundColor: _background,
+          colorScheme: ColorScheme.fromSeed(seedColor: _accent, brightness: Brightness.dark, surface: _panel),
+          useMaterial3: true,
+          dividerColor: _line,
+          sliderTheme: SliderThemeData(activeTrackColor: _accent, thumbColor: Colors.white, overlayColor: _accent.withValues(alpha: .18)),
+        ),
+        home: const EncoderWorkspace(),
+      );
 }
 
-function Get-EncoderArguments {
-    $result = @('--avhw', '--codec', $(if ($cmb_codec.SelectedIndex -eq 0) { 'h264' } else { 'hevc' }),
-        '--cqp', [string][int]$sl_quality.Value, '-i', $txt_input.Text.Trim(), '-o', $txt_output.Text.Trim())
-    if ($chk_knn.IsChecked) {
-        $result += @('--vpp-knn', ('radius={0},strength={1:0.00}' -f [int]$sl_knn_radius.Value, [double]$sl_knn_strength.Value))
+class EncoderWorkspace extends StatefulWidget {
+  const EncoderWorkspace({super.key});
+  @override
+  State<EncoderWorkspace> createState() => _EncoderWorkspaceState();
+}
+
+class _EncoderWorkspaceState extends State<EncoderWorkspace> {
+  final _input = TextEditingController();
+  final _output = TextEditingController();
+  final _encoder = TextEditingController(text: 'NVEncC64.exe');
+  final _logScroll = ScrollController();
+  final _queue = <String>[];
+  final _log = <String>['Ready. Add videos or drop them into the queue.'];
+  String? _sourceStill, _processedStill, _selected;
+  String _codec = 'HEVC';
+  double _split = .5, _cqp = 20, _knnStrength = .08, _knnRadius = 3, _debandRange = 15, _debandThreshold = 15, _debandDither = 15, _unsharpWeight = .5;
+  int _width = 1920, _height = 1080;
+  bool _knn = true, _deband = false, _unsharp = false, _resize = false, _audioCopy = true, _busy = false, _cancel = false;
+  int _done = 0;
+  Process? _process;
+
+  @override
+  void dispose() { _process?.kill(); _input.dispose(); _output.dispose(); _encoder.dispose(); _logScroll.dispose(); super.dispose(); }
+
+  Future<List<String>> _pickVideos() async {
+    final result = await FilePicker.platform.pickFiles(type: FileType.video, allowMultiple: true);
+    return result?.files.map((f) => f.path).whereType<String>().toList() ?? [];
+  }
+  Future<void> _addVideos() async => _addPaths(await _pickVideos());
+  void _addPaths(Iterable<String> paths) {
+    setState(() {
+      for (final p in paths) { if (File(p).existsSync() && !_queue.contains(p)) _queue.add(p); }
+      _selected ??= _queue.isEmpty ? null : _queue.first;
+      if (_selected != null) _input.text = _selected!;
+      if (_output.text.isEmpty && _selected != null) _suggestOutput(_selected!);
+    });
+  }
+  String _base(String path) => path.split(RegExp(r'[/\\]')).last;
+  void _suggestOutput(String source) => _output.text = '${File(source).parent.path}${Platform.pathSeparator}${_base(source).replaceFirst(RegExp(r'\.[^.]+$'), '')}_encoded.mp4';
+  Future<void> _chooseOutput() async {
+    final path = await FilePicker.platform.saveFile(dialogTitle: 'Save encoded video', fileName: _output.text.isEmpty ? 'output.mp4' : _base(_output.text), type: FileType.video);
+    if (path != null) setState(() => _output.text = path);
+  }
+  Future<void> _loadStill(bool source) async {
+    final r = await FilePicker.platform.pickFiles(type: FileType.custom, allowedExtensions: const ['png','jpg','jpeg','bmp','webp']);
+    final p = r?.files.single.path;
+    if (p != null) setState(() { if (source) { _sourceStill = p; } else { _processedStill = p; } });
+  }
+  List<String> _args(String input, String output) {
+    final a = <String>['--avhw','--codec',_codec.toLowerCase(),'--cqp',_cqp.round().toString()];
+    if (_knn) a.addAll(['--vpp-knn','radius=${_knnRadius.round()},strength=${_knnStrength.toStringAsFixed(2)}']);
+    if (_deband) a.addAll(['--vpp-deband','range=${_debandRange.round()},thre=${_debandThreshold.round()},dither=${_debandDither.round()}']);
+    if (_unsharp) a.addAll(['--vpp-unsharp','weight=${_unsharpWeight.toStringAsFixed(2)}']);
+    if (_resize && _width > 0 && _height > 0) a.addAll(['--output-res','${_width}x$_height']);
+    if (_audioCopy) a.add('--audio-copy');
+    a.addAll(['-i',input,'-o',output]);
+    return a;
+  }
+  String _quote(String s) => s.contains(RegExp(r'\s')) ? '"${s.replaceAll('"', r'\"')}"' : s;
+  String get _command => '${_quote(_encoder.text.trim())} ${_args(_selected ?? 'INPUT', _output.text.isEmpty ? 'OUTPUT' : _output.text).map(_quote).join(' ')}';
+  void _append(String text) {
+    if (!mounted || text.trim().isEmpty) return;
+    setState(() { _log.addAll(text.split(RegExp(r'\r?\n')).where((s) => s.isNotEmpty)); if (_log.length > 500) _log.removeRange(0, _log.length - 500); });
+    WidgetsBinding.instance.addPostFrameCallback((_) { if (_logScroll.hasClients) _logScroll.jumpTo(_logScroll.position.maxScrollExtent); });
+  }
+  Future<void> _start() async {
+    if (_queue.isEmpty) { _append('Add at least one source video.'); return; }
+    if (_output.text.trim().isEmpty) { _append('Choose an output path.'); return; }
+    setState(() { _busy = true; _cancel = false; _done = 0; _log.clear(); });
+    for (final source in List<String>.from(_queue)) {
+      if (_cancel) break;
+      final out = _queue.length == 1 ? _output.text.trim() : _multiOutput(source);
+      setState(() { _selected = source; _input.text = source; });
+      final args = _args(source, out);
+      _append('Encoding ${_base(source)}');
+      _append('${_encoder.text.trim()} ${args.map(_quote).join(' ')}');
+      try {
+        _process = await Process.start(_encoder.text.trim().replaceAll('"',''), args, runInShell: false);
+        _process!.stdout.transform(const SystemEncoding().decoder).listen(_append);
+        _process!.stderr.transform(const SystemEncoding().decoder).listen(_append);
+        final code = await _process!.exitCode;
+        if (code == 0) { _done++; _append('Finished: $out'); } else { _append('NVEncC exited with code $code.'); }
+      } catch (e) { _append('Could not launch NVEncC: $e'); break; }
     }
-    if ($chk_deband.IsChecked) {
-        $result += @('--vpp-deband', ('range={0},thre={1},dither={2}' -f [int]$sl_deband_range.Value, [int]$sl_deband_thre.Value, [int]$sl_deband_dither.Value))
-    }
-    if ($chk_unsharp.IsChecked) {
-        $result += @('--vpp-unsharp', ('weight={0:0.00}' -f [double]$sl_unsharp.Value))
-    }
-    if ($chk_resize.IsChecked -and [int]$txt_width.Text -gt 0 -and [int]$txt_height.Text -gt 0) {
-        $result += @('--output-res', ('{0}x{1}' -f [int]$txt_width.Text, [int]$txt_height.Text))
-    }
-    return ,$result
+    if (mounted) { setState(() { _busy = false; _process = null; }); _append(_cancel ? 'Queue stopped.' : 'Queue complete: $_done/${_queue.length}.'); }
+  }
+  String _multiOutput(String source) {
+    final ext = _output.text.contains('.') ? _output.text.substring(_output.text.lastIndexOf('.')) : '.mp4';
+    return '${File(_output.text).parent.path}${Platform.pathSeparator}${_base(source).replaceFirst(RegExp(r'\.[^.]+$'), '')}_encoded$ext';
+  }
+  Future<void> _preset() async {
+    final value = await showModalBottomSheet<String>(context: context, builder: (context) => SafeArea(child: Column(mainAxisSize: MainAxisSize.min, children: [
+      const ListTile(title: Text('Quick presets'), subtitle: Text('Starting points for NVEncC VPP filters')),
+      ListTile(title: const Text('Clean & preserve detail'), onTap: () => Navigator.pop(context,'clean')),
+      ListTile(title: const Text('Restore gradients'), onTap: () => Navigator.pop(context,'deband')),
+      ListTile(title: const Text('Resize to 1080p'), onTap: () => Navigator.pop(context,'resize')),
+    ])));
+    if (value == null) return;
+    setState(() { _knn = value != 'resize'; _deband = value == 'deband'; _unsharp = value == 'clean'; _resize = value == 'resize'; _width = 1920; _height = 1080; });
+  }
+
+  @override
+  Widget build(BuildContext context) => Scaffold(body: SafeArea(child: Column(children: [
+    _toolbar(),
+    Expanded(child: LayoutBuilder(builder: (context,c) => c.maxWidth < 860
+      ? Column(children: [Expanded(child: _workspace()), SizedBox(height: 320, child: _settings())])
+      : Row(children: [Expanded(flex: 7, child: _workspace()), SizedBox(width: 360, child: _settings())]))),
+    _status(),
+  ])));
+  Widget _toolbar() => Container(height: 56, padding: const EdgeInsets.symmetric(horizontal: 16), decoration: const BoxDecoration(color: _panel,border: Border(bottom: BorderSide(color: _line))), child: Row(children: [const Icon(Icons.movie_filter_outlined,color:_accent),const SizedBox(width:9),const Text('VPPBox',style:TextStyle(fontSize:17,fontWeight:FontWeight.bold)),const Text('  /  NVEnc',style:TextStyle(color:Colors.white54)),const Spacer(),Text('${_queue.length} queued',style:const TextStyle(fontSize:11,color:Colors.white60)),IconButton(tooltip:'Presets',onPressed:_preset,icon:const Icon(Icons.tune)),IconButton(tooltip:'Add videos',onPressed:_addVideos,icon:const Icon(Icons.video_library_outlined)),IconButton(tooltip:'Output',onPressed:_chooseOutput,icon:const Icon(Icons.save_outlined))]));
+  Widget _workspace() => Padding(padding:const EdgeInsets.all(14),child:Column(children:[Expanded(flex:7,child:_card(Column(children:[Row(children:[const Text('BEFORE / AFTER PREVIEW',style:TextStyle(fontSize:10,fontWeight:FontWeight.bold,color:Colors.white70,letterSpacing:1)),const Spacer(),_button('Original',Icons.image_outlined,()=>_loadStill(true)),const SizedBox(width:5),_button('Processed',Icons.image,()=>_loadStill(false))]),const SizedBox(height:8),Expanded(child:_Compare(source:_sourceStill,processed:_processedStill,split:_split,onChange:(v)=>setState(()=>_split=v))),Row(children:[const Text('Original',style:TextStyle(fontSize:10,color:Colors.white54)),Expanded(child:Slider(value:_split,min:.02,max:.98,onChanged:(v)=>setState(()=>_split=v))),const Text('Processed',style:TextStyle(fontSize:10,color:Colors.white54))])]))),const SizedBox(height:9),Expanded(flex:3,child:_queuePanel()),const SizedBox(height:9),SizedBox(height:112,child:_card(Column(crossAxisAlignment:CrossAxisAlignment.stretch,children:[const Text('PROCESSING LOG',style:TextStyle(fontSize:10,fontWeight:FontWeight.bold,color:Colors.white60)),const SizedBox(height:5),Expanded(child:ListView(controller:_logScroll,children:_log.map((s)=>Text(s,style:const TextStyle(fontFamily:'monospace',fontSize:10,color:Colors.white60))).toList()))]))) ]));
+  Widget _queuePanel() => _card(Column(children:[Row(children:[const Text('VIDEO QUEUE',style:TextStyle(fontSize:10,fontWeight:FontWeight.bold,color:Colors.white70,letterSpacing:1)),const Spacer(),TextButton.icon(onPressed:_addVideos,icon:const Icon(Icons.add,size:15),label:const Text('Add')),TextButton(onPressed:_busy?null:()=>setState(()=>_queue.clear()),child:const Text('Clear'))]),Expanded(child:_queue.isEmpty?const Center(child:Text('Drop videos here or choose Add',style:TextStyle(color:Colors.white54))):ListView.builder(itemCount:_queue.length,itemBuilder:(context,i){final p=_queue[i];return ListTile(dense:true,selected:p==_selected,leading:Icon(p==_selected?Icons.play_arrow:Icons.video_file_outlined,color:p==_selected?_accent:Colors.white54),title:Text(_base(p),overflow:TextOverflow.ellipsis),subtitle:Text(p,overflow:TextOverflow.ellipsis,style:const TextStyle(fontSize:9)),onTap:(){setState(()=>_selected=p);_input.text=p;_suggestOutput(p);},trailing:IconButton(icon:const Icon(Icons.close,size:16),onPressed:_busy?null:()=>setState(()=>_queue.remove(p))));} ))]));
+  Widget _settings() => Container(decoration:const BoxDecoration(color:_panel,border:Border(left:BorderSide(color:_line))),child:Column(children:[const Padding(padding:EdgeInsets.all(13),child:Row(children:[Icon(Icons.tune,color:_accent,size:18),SizedBox(width:8),Text('ENCODE & VPP',style:TextStyle(fontSize:11,fontWeight:FontWeight.bold,letterSpacing:1))])),Expanded(child:ListView(padding:const EdgeInsets.fromLTRB(13,0,13,13),children:[_section('SOURCE & OUTPUT'),_path('Input',_input,_addVideos),const SizedBox(height:6),_path('Output',_output,_chooseOutput),const SizedBox(height:7),_smallLabel('NVEncC executable'),TextField(controller:_encoder,decoration:const InputDecoration(hintText:'NVEncC64.exe')),const SizedBox(height:9),_smallLabel('Codec'),DropdownButtonFormField<String>(value:_codec,items:const[DropdownMenuItem(value:'H.264',child:Text('H.264 / AVC')),DropdownMenuItem(value:'HEVC',child:Text('HEVC / H.265'))],onChanged:(v)=>setState(()=>_codec=v??'HEVC')),_section('ENCODING QUALITY'),_range('CQP quality',_cqp,1,51,(v)=>setState(()=>_cqp=v),value:_cqp.round().toString()),SwitchListTile.adaptive(contentPadding:EdgeInsets.zero,dense:true,title:const Text('Copy audio',style:TextStyle(fontSize:11)),value:_audioCopy,onChanged:(v)=>setState(()=>_audioCopy=v)),_section('VPP FILTER PIPELINE'),_filter('DENOISE','--vpp-knn',_knn,(v)=>setState(()=>_knn=v),[_range('Strength',_knnStrength,0,1,(v)=>setState(()=>_knnStrength=v),value:_knnStrength.toStringAsFixed(2)),_range('Radius',_knnRadius,1,5,(v)=>setState(()=>_knnRadius=v),divisions:4,value:_knnRadius.round().toString())]),_filter('DEBAND','--vpp-deband',_deband,(v)=>setState(()=>_deband=v),[_range('Range',_debandRange,0,127,(v)=>setState(()=>_debandRange=v),divisions:127,value:_debandRange.round().toString()),_range('Threshold',_debandThreshold,0,31,(v)=>setState(()=>_debandThreshold=v),divisions:31,value:_debandThreshold.round().toString()),_range('Dither',_debandDither,0,31,(v)=>setState(()=>_debandDither=v),divisions:31,value:_debandDither.round().toString())]),_filter('DETAIL','--vpp-unsharp',_unsharp,(v)=>setState(()=>_unsharp=v),[_range('Weight',_unsharpWeight,0,10,(v)=>setState(()=>_unsharpWeight=v),value:_unsharpWeight.toStringAsFixed(2))]),_filter('FRAMING','--output-res',_resize,(v)=>setState(()=>_resize=v),[Row(children:[Expanded(child:_number('Width',_width,(v)=>setState(()=>_width=v))),const SizedBox(width:7),Expanded(child:_number('Height',_height,(v)=>setState(()=>_height=v)))])]),_section('COMMAND PREVIEW'),Container(color:_background,padding:const EdgeInsets.all(8),child:SelectableText(_command,style:const TextStyle(fontFamily:'monospace',fontSize:9,color:Colors.white70))) ]))]));
+  Widget _status() => Container(height:46,padding:const EdgeInsets.symmetric(horizontal:16),decoration:const BoxDecoration(color:_panel,border:Border(top:BorderSide(color:_line))),child:Row(children:[Icon(Icons.circle,size:8,color:_busy?Colors.orangeAccent:Colors.greenAccent),const SizedBox(width:7),Text(_busy?'Encoding ${_done+1}/${_queue.length}':'Ready',style:const TextStyle(fontSize:11,color:Colors.white70)),const Spacer(),if(_busy)TextButton.icon(onPressed:(){_cancel=true;_process?.kill();},icon:const Icon(Icons.stop,size:16),label:const Text('Stop')),const SizedBox(width:6),FilledButton.icon(onPressed:_busy?null:_start,icon:Icon(_busy?Icons.hourglass_top:Icons.play_arrow,size:17),label:Text(_busy?'Encoding…':'Go (${_queue.length})'),style:FilledButton.styleFrom(backgroundColor:_accent))]));
+  Widget _card(Widget child)=>Container(width:double.infinity,padding:const EdgeInsets.all(10),decoration:BoxDecoration(color:_panel,border:Border.all(color:_line),borderRadius:BorderRadius.circular(6)),child:child);
+  Widget _section(String text)=>Padding(padding:const EdgeInsets.only(top:10,bottom:6),child:Text(text,style:const TextStyle(fontSize:9,fontWeight:FontWeight.bold,color:Colors.white54,letterSpacing:1)));
+  Widget _smallLabel(String text)=>Padding(padding:const EdgeInsets.only(bottom:4),child:Text(text,style:const TextStyle(fontSize:10,color:Colors.white60)));
+  Widget _path(String label,TextEditingController c,VoidCallback pick)=>Column(crossAxisAlignment:CrossAxisAlignment.start,children:[_smallLabel(label),Row(children:[Expanded(child:TextField(controller:c,decoration:InputDecoration(hintText:'Choose $label…'))),IconButton(onPressed:pick,icon:const Icon(Icons.folder_open,size:17))])]);
+  Widget _button(String s,IconData i,VoidCallback f)=>OutlinedButton.icon(onPressed:f,icon:Icon(i,size:14),label:Text(s,style:const TextStyle(fontSize:10)),style:OutlinedButton.styleFrom(padding:const EdgeInsets.symmetric(horizontal:8,vertical:5)));
+  Widget _range(String label,double v,double min,double max,ValueChanged<double> change,{int? divisions,required String value})=>Row(children:[SizedBox(width:67,child:Text(label,style:const TextStyle(fontSize:9,color:Colors.white60))),Expanded(child:Slider(value:v.clamp(min,max),min:min,max:max,divisions:divisions,onChanged:change)),SizedBox(width:30,child:Text(value,textAlign:TextAlign.right,style:const TextStyle(fontSize:9,fontFeatures:[FontFeature.tabularFigures()] )))]);
+  Widget _filter(String title,String flag,bool value,ValueChanged<bool> changed,List<Widget> children)=>Container(margin:const EdgeInsets.only(bottom:6),decoration:BoxDecoration(color:const Color(0xFF292D35),borderRadius:BorderRadius.circular(5)),child:ExpansionTile(initiallyExpanded:value,tilePadding:const EdgeInsets.symmetric(horizontal:7),childrenPadding:const EdgeInsets.fromLTRB(8,0,8,7),leading:Checkbox(value:value,onChanged:(v)=>changed(v??false)),title:Text(title,style:const TextStyle(fontSize:10,fontWeight:FontWeight.bold)),subtitle:Text(flag,style:const TextStyle(fontFamily:'monospace',fontSize:8,color:Colors.white54)),children:children));
+  Widget _number(String label,int val,ValueChanged<int> update)=>Column(crossAxisAlignment:CrossAxisAlignment.start,children:[_smallLabel(label),TextFormField(initialValue:val.toString(),keyboardType:TextInputType.number,onChanged:(s)=>update(int.tryParse(s)??0),decoration:const InputDecoration())]);
 }
 
-function Quote-Argument([string]$Value) {
-    if ($Value -notmatch '[\s"]') { return $Value }
-    # Windows command-line quoting: escape backslashes before quotes and the closing quote.
-    $escaped = $Value -replace '(\\*)"', '$1$1\"'
-    $escaped = $escaped -replace '(\\+)$', '$1$1'
-    return '"' + $escaped + '"'
+class _Compare extends StatelessWidget {
+  const _Compare({required this.source,required this.processed,required this.split,required this.onChange});
+  final String? source,processed; final double split; final ValueChanged<double> onChange;
+  @override Widget build(BuildContext context)=>LayoutBuilder(builder:(context,c){final w=c.maxWidth;return GestureDetector(behavior:HitTestBehavior.opaque,onTapDown:(d)=>onChange((d.localPosition.dx/w).clamp(.02,.98)),onHorizontalDragUpdate:(d)=>onChange((split+d.delta.dx/w).clamp(.02,.98)),child:ClipRRect(borderRadius:BorderRadius.circular(4),child:Stack(fit:StackFit.expand,children:[_picture(processed,const Color(0xFF303841)),ClipRect(clipper:_Clip(split),child:_picture(source,const Color(0xFF414149))),Positioned(left:w*split-1.5,top:0,bottom:0,child:Container(width:3,color:Colors.white,boxShadow:[BoxShadow(color:Colors.black.withValues(alpha:.5),blurRadius:4)])),Positioned(left:w*split-18,top:c.maxHeight/2-18,child:Container(width:36,height:36,decoration:const BoxDecoration(color:Colors.white,shape:BoxShape.circle),child:const Icon(Icons.compare_arrows,color:Colors.black87,size:18))),Positioned(left:9,top:9,child:_label('Original')),Positioned(right:9,top:9,child:_label('Processed')),if(source==null&&processed==null)const Center(child:Text('Load stills to compare',style:TextStyle(color:Colors.white60)))])));});
+  Widget _picture(String? path,Color fallback)=>ColoredBox(color:fallback,child:path==null?const SizedBox.expand():Image.file(File(path),fit:BoxFit.contain,errorBuilder:(_,__,___)=>const Center(child:Text('Image unavailable'))));
+  Widget _label(String text)=>Container(padding:const EdgeInsets.symmetric(horizontal:7,vertical:4),decoration:BoxDecoration(color:Colors.black.withValues(alpha:.7),borderRadius:BorderRadius.circular(4)),child:Text(text,style:const TextStyle(fontSize:9)));
 }
-
-function Update-CommandPreview {
-    if (-not $txt_command) { return }
-    $exe = Resolve-NVEncC
-    $parts = @($exe) + @(Get-EncoderArguments)
-    $txt_command.Text = (($parts | ForEach-Object { Quote-Argument ([string]$_) }) -join ' ')
-}
-
-function Add-Log([string]$Text) {
-    if ([string]::IsNullOrWhiteSpace($Text)) { return }
-    $txt_log.AppendText($Text.TrimEnd() + "`r`n")
-    $txt_log.ScrollToEnd()
-}
-
-function Read-NewLines([string]$Path, [ref]$Offset) {
-    if (-not (Test-Path -LiteralPath $Path)) { return }
-    try {
-        $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
-        try {
-            if ($stream.Length -lt $Offset.Value) { $Offset.Value = 0 }
-            [void]$stream.Seek($Offset.Value, [System.IO.SeekOrigin]::Begin)
-            $reader = New-Object System.IO.StreamReader($stream)
-            $text = $reader.ReadToEnd()
-            $Offset.Value = $stream.Position
-            if ($text) { return $text -split "`r?`n" | Where-Object { $_ } }
-        } finally { $stream.Dispose() }
-    } catch { }
-}
-
-function Browse-Input {
-    $dialog = New-Object System.Windows.Forms.OpenFileDialog
-    $dialog.Title = 'Choose a video'
-    $dialog.Filter = 'Video files|*.mp4;*.mkv;*.mov;*.avi;*.m2ts;*.mts;*.ts;*.webm|All files|*.*'
-    if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
-        $txt_input.Text = $dialog.FileName
-        if (-not $txt_output.Text) {
-            $txt_output.Text = Join-Path (Split-Path -Parent $dialog.FileName) (([IO.Path]::GetFileNameWithoutExtension($dialog.FileName)) + '_encoded.mp4')
-        }
-        Update-CommandPreview
-    }
-}
-
-function Browse-Output {
-    $dialog = New-Object System.Windows.Forms.SaveFileDialog
-    $dialog.Title = 'Choose encoded video output'
-    $dialog.Filter = 'MP4 video|*.mp4|Matroska video|*.mkv|All files|*.*'
-    $dialog.FileName = if ($txt_output.Text) { [IO.Path]::GetFileName($txt_output.Text) } else { 'output.mp4' }
-    if ($txt_output.Text -and (Test-Path (Split-Path -Parent $txt_output.Text))) { $dialog.InitialDirectory = Split-Path -Parent $txt_output.Text }
-    if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { $txt_output.Text = $dialog.FileName; Update-CommandPreview }
-}
-
-function Load-Still([bool]$Original) {
-    $dialog = New-Object System.Windows.Forms.OpenFileDialog
-    $dialog.Title = if ($Original) { 'Load original still' } else { 'Load processed still' }
-    $dialog.Filter = 'Image files|*.png;*.jpg;*.jpeg;*.bmp;*.webp|All files|*.*'
-    if ($dialog.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { return }
-    try {
-        $bitmap = New-Object System.Windows.Media.Imaging.BitmapImage
-        $bitmap.BeginInit(); $bitmap.CacheOption = [System.Windows.Media.Imaging.BitmapCacheOption]::OnLoad
-        $bitmap.UriSource = [Uri]$dialog.FileName; $bitmap.EndInit(); $bitmap.Freeze()
-        if ($Original) { $img_original.Source = $bitmap } else { $img_processed.Source = $bitmap }
-        Update-Comparison
-    } catch { [System.Windows.MessageBox]::Show("Could not load image: $_", 'Preview', 'OK', 'Warning') | Out-Null }
-}
-
-function Update-Comparison {
-    if (-not $preview_grid.ActualWidth) { return }
-    $split = [double]$sl_split.Value
-    $clip_original.Rect = New-Object System.Windows.Rect(0, 0, ($preview_grid.ActualWidth * $split), $preview_grid.ActualHeight)
-    $divider.Margin = New-Object System.Windows.Thickness(($preview_grid.ActualWidth * $split - 1.5), 0, 0, 0)
-    $divider.HorizontalAlignment = 'Left'
-}
-
-function Start-Encoding {
-    if ($Script:Process -and -not $Script:Process.HasExited) { return }
-    if (-not (Test-Path -LiteralPath $txt_input.Text)) {
-        [System.Windows.MessageBox]::Show('Select a valid input video first.', 'Missing input', 'OK', 'Warning') | Out-Null; return
-    }
-    if ([string]::IsNullOrWhiteSpace($txt_output.Text)) {
-        [System.Windows.MessageBox]::Show('Choose an output file.', 'Missing output', 'OK', 'Warning') | Out-Null; return
-    }
-    $exe = Resolve-NVEncC
-    if ($exe -eq 'NVEncC64.exe' -and -not (Get-Command $exe -ErrorAction SilentlyContinue)) {
-        [System.Windows.MessageBox]::Show('NVEncC64.exe was not found. Put it beside this script or add it to PATH.', 'Missing NVEncC', 'OK', 'Error') | Out-Null; return
-    }
-    $encoderArgs = @(Get-EncoderArguments)
-    $start = New-Object System.Diagnostics.ProcessStartInfo
-    $start.FileName = $exe
-    $start.Arguments = (($encoderArgs | ForEach-Object { Quote-Argument ([string]$_) }) -join ' ')
-    $start.UseShellExecute = $false
-    $start.CreateNoWindow = $true
-    $start.RedirectStandardOutput = $true
-    $start.RedirectStandardError = $true
-    $start.StandardOutputEncoding = [System.Text.Encoding]::UTF8
-    $start.StandardErrorEncoding = [System.Text.Encoding]::UTF8
-    # Redirect through temp files so WPF remains responsive without a job/runspace.
-    $start.RedirectStandardOutput = $false
-    $start.RedirectStandardError = $false
-    $Script:ReadOut = 0L; $Script:ReadErr = 0L
-    Set-Content -LiteralPath $Script:StdoutPath -Value '' -Encoding UTF8
-    Set-Content -LiteralPath $Script:StderrPath -Value '' -Encoding UTF8
-    # Start-Process owns output redirection while a DispatcherTimer tails the files.
-    $Script:Process = Start-Process -FilePath $exe -ArgumentList $start.Arguments -PassThru -NoNewWindow -RedirectStandardOutput $Script:StdoutPath -RedirectStandardError $Script:StderrPath
-    $btn_start.IsEnabled = $false; $btn_stop.IsEnabled = $true
-    $lbl_status.Text = 'Encoding…'
-    $txt_log.Clear(); Add-Log "NVEncC started:`r`n$txt_command.Text"
-    $Script:PollTimer.Start()
-}
-
-function Stop-Encoding {
-    if ($Script:Process -and -not $Script:Process.HasExited) {
-        try { $Script:Process.Kill() } catch { }
-        $lbl_status.Text = 'Stopped'
-        Add-Log 'Stop requested.'
-    }
-}
-
-[xml]$xaml = @'
-<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
-        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="VapourBox · HWEnc" Width="1180" Height="820" MinWidth="900" MinHeight="650"
-        WindowStartupLocation="CenterScreen" Background="#111318" Foreground="#E8EAF0">
-  <Grid Margin="12">
-    <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
-    <Border Grid.Row="0" Background="#1A1D24" CornerRadius="8" Padding="14" Margin="0,0,0,10">
-      <DockPanel><StackPanel Orientation="Horizontal"><TextBlock Text="◈  VAPOURBOX" FontSize="17" FontWeight="Bold" Foreground="#A99AFF"/><TextBlock Text="  /  NVENC" FontSize="14" VerticalAlignment="Center" Foreground="#9BA0AE"/></StackPanel><TextBlock x:Name="lbl_status" DockPanel.Dock="Right" Text="Ready" VerticalAlignment="Center" Foreground="#B7BBC6"/></DockPanel>
-    </Border>
-    <Grid Grid.Row="1"><Grid.ColumnDefinitions><ColumnDefinition Width="1.7*"/><ColumnDefinition Width="1*"/></Grid.ColumnDefinitions>
-      <Grid Grid.Column="0" Margin="0,0,10,0"><Grid.RowDefinitions><RowDefinition Height="*"/><RowDefinition Height="155"/></Grid.RowDefinitions>
-        <Border Grid.Row="0" Background="#1A1D24" CornerRadius="8" Padding="12" Margin="0,0,0,10">
-          <Grid><Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
-            <DockPanel Margin="0,0,0,9"><TextBlock Text="COMPARATIVE PREVIEW" FontWeight="Bold" FontSize="11" Foreground="#A8ACB7"/><StackPanel DockPanel.Dock="Right" Orientation="Horizontal"><Button x:Name="btn_original" Content="Load original" Margin="0,0,6,0" Padding="8,4"/><Button x:Name="btn_processed" Content="Load processed" Padding="8,4"/></StackPanel></DockPanel>
-            <Border Grid.Row="1" Background="#252A33" CornerRadius="6" ClipToBounds="True"><Grid x:Name="preview_grid" SizeChanged="PreviewSizeChanged">
-              <Image x:Name="img_processed" Stretch="Uniform"/><Image x:Name="img_original" Stretch="Uniform"><Image.Clip><RectangleGeometry x:Name="clip_original" Rect="0,0,0,0"/></Image.Clip></Image>
-              <Border x:Name="divider" Width="3" Background="White" HorizontalAlignment="Left" IsHitTestVisible="False"/>
-              <TextBlock Text="Original" HorizontalAlignment="Left" VerticalAlignment="Top" Margin="10" Padding="7,4" Background="#AA000000"/>
-              <TextBlock Text="Processed" HorizontalAlignment="Right" VerticalAlignment="Top" Margin="10" Padding="7,4" Background="#AA000000"/>
-              <TextBlock Text="Load original and processed stills to compare" HorizontalAlignment="Center" VerticalAlignment="Center" Foreground="#7F8795" IsHitTestVisible="False"/>
-            </Grid></Border>
-            <DockPanel Grid.Row="2" Margin="0,8,0,0"><TextBlock Text="Original" Foreground="#8C919D" VerticalAlignment="Center"/><Slider x:Name="sl_split" Minimum="0.02" Maximum="0.98" Value="0.5" Margin="8,0"/><TextBlock Text="Processed" Foreground="#8C919D" VerticalAlignment="Center"/></DockPanel>
-          </Grid>
-        </Border>
-        <Border Grid.Row="1" Background="#1A1D24" CornerRadius="8" Padding="10"><Grid><Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions><TextBlock Text="NVEncC LOG" FontSize="10" FontWeight="Bold" Foreground="#A8ACB7" Margin="2,0,0,6"/><TextBox x:Name="txt_log" Grid.Row="1" IsReadOnly="True" AcceptsReturn="True" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto" Background="#111318" BorderThickness="0" FontFamily="Consolas" FontSize="11"/></Grid></Border>
-      </Grid>
-      <Border Grid.Column="1" Background="#1A1D24" CornerRadius="8" Padding="12"><ScrollViewer VerticalScrollBarVisibility="Auto"><StackPanel>
-        <TextBlock Text="ENCODE &amp; VPP" FontSize="12" FontWeight="Bold" Foreground="#A99AFF" Margin="0,0,0,10"/>
-        <TextBlock Text="Input video" Foreground="#A8ACB7" FontSize="11"/><DockPanel Margin="0,4,0,9"><TextBox x:Name="txt_input"/><Button x:Name="btn_input" Content="Browse…" DockPanel.Dock="Right" Margin="6,0,0,0" Padding="8,4"/></DockPanel>
-        <TextBlock Text="Output file" Foreground="#A8ACB7" FontSize="11"/><DockPanel Margin="0,4,0,10"><TextBox x:Name="txt_output"/><Button x:Name="btn_output" Content="Browse…" DockPanel.Dock="Right" Margin="6,0,0,0" Padding="8,4"/></DockPanel>
-        <TextBlock Text="Codec" Foreground="#A8ACB7" FontSize="11"/><ComboBox x:Name="cmb_codec" SelectedIndex="1" Margin="0,4,0,10"><ComboBoxItem Content="H.264 / AVC"/><ComboBoxItem Content="HEVC / H.265"/></ComboBox>
-        <TextBlock Text="CQP quality" Foreground="#A8ACB7" FontSize="11"/><DockPanel Margin="0,2,0,10"><Slider x:Name="sl_quality" Minimum="1" Maximum="51" Value="20"/><TextBlock x:Name="lbl_quality" Text="20" Width="32" VerticalAlignment="Center" TextAlignment="Right"/></DockPanel>
-        <Separator Margin="0,4,0,10"/><TextBlock Text="VIDEO PROCESSING FILTERS" FontSize="10" FontWeight="Bold" Foreground="#A8ACB7" Margin="0,0,0,7"/>
-        <CheckBox x:Name="chk_knn" Content="KNN denoise (--vpp-knn)" IsChecked="True" Margin="0,4"/><TextBlock Text="Strength" Foreground="#8C919D" FontSize="10"/><DockPanel><Slider x:Name="sl_knn_strength" Minimum="0" Maximum="1" Value="0.08"/><TextBlock x:Name="lbl_knn_strength" Text="0.08" Width="36" VerticalAlignment="Center" TextAlignment="Right"/></DockPanel><TextBlock Text="Radius" Foreground="#8C919D" FontSize="10"/><DockPanel Margin="0,0,0,7"><Slider x:Name="sl_knn_radius" Minimum="1" Maximum="5" Value="3" TickFrequency="1" IsSnapToTickEnabled="True"/><TextBlock x:Name="lbl_knn_radius" Text="3" Width="36" VerticalAlignment="Center" TextAlignment="Right"/></DockPanel>
-        <CheckBox x:Name="chk_deband" Content="Deband (--vpp-deband)" Margin="0,4"/><TextBlock Text="Range / threshold / dither" Foreground="#8C919D" FontSize="10"/><DockPanel Margin="0,0,0,7"><Slider x:Name="sl_deband_range" Minimum="0" Maximum="127" Value="15"/><TextBlock x:Name="lbl_deband_range" Text="15" Width="34" VerticalAlignment="Center" TextAlignment="Right"/><Slider x:Name="sl_deband_thre" Minimum="0" Maximum="31" Value="15"/><TextBlock x:Name="lbl_deband_thre" Text="15" Width="30" VerticalAlignment="Center" TextAlignment="Right"/><Slider x:Name="sl_deband_dither" Minimum="0" Maximum="31" Value="15"/><TextBlock x:Name="lbl_deband_dither" Text="15" Width="30" VerticalAlignment="Center" TextAlignment="Right"/></DockPanel>
-        <CheckBox x:Name="chk_unsharp" Content="Unsharp (--vpp-unsharp)" Margin="0,4"/><DockPanel Margin="0,0,0,7"><Slider x:Name="sl_unsharp" Minimum="0" Maximum="10" Value="0.5"/><TextBlock x:Name="lbl_unsharp" Text="0.50" Width="36" VerticalAlignment="Center" TextAlignment="Right"/></DockPanel>
-        <CheckBox x:Name="chk_resize" Content="Resize (--output-res)" Margin="0,4"/><DockPanel Margin="0,0,0,10"><TextBox x:Name="txt_width" Text="1920" ToolTip="Output width"/><TextBlock Text=" × " VerticalAlignment="Center"/><TextBox x:Name="txt_height" Text="1080" ToolTip="Output height"/></DockPanel>
-        <TextBlock Text="COMMAND PREVIEW" FontSize="10" FontWeight="Bold" Foreground="#A8ACB7" Margin="0,0,0,6"/><TextBox x:Name="txt_command" IsReadOnly="True" TextWrapping="Wrap" AcceptsReturn="True" MinHeight="65" Background="#111318" BorderThickness="0" FontFamily="Consolas" FontSize="10" Padding="8"/>
-      </StackPanel></ScrollViewer></Border>
-    </Grid>
-    <DockPanel Grid.Row="2" Margin="0,10,0,0"><TextBlock Text="NVEncC Windows • VapourBox-inspired workflow" Foreground="#727987" VerticalAlignment="Center" FontSize="10"/><StackPanel DockPanel.Dock="Right" Orientation="Horizontal"><Button x:Name="btn_stop" Content="Stop" IsEnabled="False" MinWidth="85" Margin="0,0,8,0" Padding="10,7"/><Button x:Name="btn_start" Content="Start encode" MinWidth="115" Padding="12,7" Background="#7564D8" Foreground="White" FontWeight="Bold"/></StackPanel></DockPanel>
-  </Grid>
-</Window>
-'@
-
-$reader = New-Object System.Xml.XmlNodeReader $xaml
-$window = [Windows.Markup.XamlReader]::Load($reader)
-$controlNames = @('lbl_status','txt_log','txt_input','txt_output','cmb_codec','sl_quality','lbl_quality','chk_knn','sl_knn_strength','lbl_knn_strength','sl_knn_radius','lbl_knn_radius','chk_deband','sl_deband_range','lbl_deband_range','sl_deband_thre','lbl_deband_thre','sl_deband_dither','lbl_deband_dither','chk_unsharp','sl_unsharp','lbl_unsharp','chk_resize','txt_width','txt_height','txt_command','btn_input','btn_output','btn_original','btn_processed','preview_grid','img_original','img_processed','clip_original','divider','sl_split','btn_start','btn_stop')
-foreach ($name in $controlNames) { Set-Variable -Name $name -Value $window.FindName($name) -Scope Script }
-
-$btn_input.Add_Click({ Browse-Input })
-$btn_output.Add_Click({ Browse-Output })
-$btn_original.Add_Click({ Load-Still $true })
-$btn_processed.Add_Click({ Load-Still $false })
-$btn_start.Add_Click({ Start-Encoding })
-$btn_stop.Add_Click({ Stop-Encoding })
-$sl_split.Add_ValueChanged({ Update-Comparison })
-$preview_grid.Add_SizeChanged({ Update-Comparison })
-$txt_input.Add_TextChanged({ Update-CommandPreview })
-$txt_output.Add_TextChanged({ Update-CommandPreview })
-$cmb_codec.Add_SelectionChanged({ Update-CommandPreview })
-$txt_width.Add_TextChanged({ Update-CommandPreview })
-$txt_height.Add_TextChanged({ Update-CommandPreview })
-$filterControls = @($chk_knn,$sl_knn_strength,$sl_knn_radius,$chk_deband,$sl_deband_range,$sl_deband_thre,$sl_deband_dither,$chk_unsharp,$sl_unsharp,$chk_resize)
-foreach ($control in $filterControls) {
-    if ($control -is [System.Windows.Controls.Slider]) { $control.Add_ValueChanged({ Update-CommandPreview }) }
-    elseif ($control -is [System.Windows.Controls.CheckBox]) { $control.Add_Checked({ Update-CommandPreview }); $control.Add_Unchecked({ Update-CommandPreview }) }
-}
-$sl_quality.Add_ValueChanged({ $lbl_quality.Text = [string][int]$sl_quality.Value; Update-CommandPreview })
-$sl_knn_strength.Add_ValueChanged({ $lbl_knn_strength.Text = '{0:0.00}' -f $sl_knn_strength.Value })
-$sl_knn_radius.Add_ValueChanged({ $lbl_knn_radius.Text = [string][int]$sl_knn_radius.Value })
-$sl_deband_range.Add_ValueChanged({ $lbl_deband_range.Text = [string][int]$sl_deband_range.Value })
-$sl_deband_thre.Add_ValueChanged({ $lbl_deband_thre.Text = [string][int]$sl_deband_thre.Value })
-$sl_deband_dither.Add_ValueChanged({ $lbl_deband_dither.Text = [string][int]$sl_deband_dither.Value })
-$sl_unsharp.Add_ValueChanged({ $lbl_unsharp.Text = '{0:0.00}' -f $sl_unsharp.Value })
-
-$Script:PollTimer = New-Object System.Windows.Threading.DispatcherTimer
-$Script:PollTimer.Interval = [TimeSpan]::FromMilliseconds(400)
-$Script:PollTimer.Add_Tick({
-    foreach ($line in (Read-NewLines $Script:StdoutPath ([ref]$Script:ReadOut))) { Add-Log $line }
-    foreach ($line in (Read-NewLines $Script:StderrPath ([ref]$Script:ReadErr))) { Add-Log $line }
-    if ($Script:Process -and $Script:Process.HasExited) {
-        $Script:PollTimer.Stop(); $btn_start.IsEnabled = $true; $btn_stop.IsEnabled = $false
-        if ($Script:Process.ExitCode -eq 0) { $lbl_status.Text = 'Completed'; Add-Log 'Encode completed.' }
-        else { $lbl_status.Text = "Failed (exit $($Script:Process.ExitCode))"; Add-Log "NVEncC exited with code $($Script:Process.ExitCode)." }
-        $Script:Process = $null
-    }
-})
-
-$window.Add_Closing({
-    $Script:Closing = $true
-    if ($Script:PollTimer) { $Script:PollTimer.Stop() }
-    if ($Script:Process -and -not $Script:Process.HasExited) { try { $Script:Process.Kill() } catch { } }
-    Remove-Item $Script:StdoutPath,$Script:StderrPath -Force -ErrorAction SilentlyContinue
-})
-Update-CommandPreview
-$sl_knn_strength.RaiseEvent((New-Object System.Windows.RoutedEventArgs([System.Windows.Controls.Slider]::ValueChangedEvent)))
-$sl_knn_radius.RaiseEvent((New-Object System.Windows.RoutedEventArgs([System.Windows.Controls.Slider]::ValueChangedEvent)))
-$sl_deband_range.RaiseEvent((New-Object System.Windows.RoutedEventArgs([System.Windows.Controls.Slider]::ValueChangedEvent)))
-$sl_deband_thre.RaiseEvent((New-Object System.Windows.RoutedEventArgs([System.Windows.Controls.Slider]::ValueChangedEvent)))
-$sl_deband_dither.RaiseEvent((New-Object System.Windows.RoutedEventArgs([System.Windows.Controls.Slider]::ValueChangedEvent)))
-$sl_unsharp.RaiseEvent((New-Object System.Windows.RoutedEventArgs([System.Windows.Controls.Slider]::ValueChangedEvent)))
-$null = $window.ShowDialog()
+class _Clip extends CustomClipper<Rect>{const _Clip(this.split);final double split;@override Rect getClip(Size s)=>Rect.fromLTWH(0,0,s.width*split,s.height);@override bool shouldReclip(_Clip old)=>old.split!=split;}
