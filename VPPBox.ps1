@@ -1,12 +1,12 @@
-﻿# VPPBox v2.6 - PowerShell GUI for rigaya hardware encoders (NVEncC64 / QSVEncC64 / VCEEncC64)
+﻿# VPPBox v0.6 - PowerShell GUI for rigaya hardware encoders (NVEncC64 / QSVEncC64 / VCEEncC64)
 # Windows PowerShell 5.1 and PowerShell 7. No VapourSynth, no FFmpeg.
 #
-# v2.6  Encoder/GPU detection is the v1 method again (Resolve-EncoderExecutable + Test-Path / Get-Command, one entry per GPU,
+# v0.6  Encoder/GPU detection is the v1 method again (Resolve-EncoderExecutable + Test-Path / Get-Command, one entry per GPU,
 #       Tag = path string). v2.4/v2.5 failed because "return ,$array" + "@(Get-...)" produced NESTED arrays, so the folder loop
 #       called .TrimEnd() on an array inside a try/catch and silently found nothing. The same bug also garbled the command preview.
 #       No function in this script returns "," arrays any more.
-# v2.5  real-bounds draggable preview divider, cached/cancellable preview, progress bar, drag & drop.
-# v2.4  window <= 90% of screen.   v2.3 preview via child process + UI timer, safe C# helper, corrected VPP syntax.
+# v0.5  real-bounds draggable preview divider, cached/cancellable preview, progress bar, drag & drop.
+# v0.4  window <= 90% of screen.   v2.3 preview via child process + UI timer, safe C# helper, corrected VPP syntax.
 
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Windows.Forms
 Add-Type -AssemblyName Microsoft.VisualBasic
