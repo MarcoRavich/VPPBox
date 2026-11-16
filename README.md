@@ -10,10 +10,6 @@ A Powershell GUI inspired by Stuart Cameron's [VapourBox](https://github.com/Stu
 - VPP settings for KNN denoise, deband, unsharp, and resize, with a generated encoder command preview.
 - Quick starting presets for detail-preserving cleanup, debanding, and 1080p resize.
 
-## Screenshot
-
-<img width="100%" alt="VPPBox" src="https://github.com/user-attachments/assets/a2084c8a-2a40-4717-99ef-a2d3f35147a0" />
-
 ## Run
 
 ```powershell -ExecutionPolicy Bypass -File VPPBox.ps1```
