@@ -16,7 +16,7 @@ A Powershell GUI inspired by Stuart Cameron's [VapourBox](https://github.com/Stu
 
 ## Run
 
-powershell -ExecutionPolicy Bypass -File VPPBox.ps1
+```powershell -ExecutionPolicy Bypass -File VPPBox.ps1```
 
 
 
