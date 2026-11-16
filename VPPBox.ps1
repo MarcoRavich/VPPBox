@@ -53,7 +53,7 @@ function Set-Status {
 function Update-IdleStatus {
     if ($Script:QueueActive -or $Script:Closing) { return }
     if (Get-SelectedEncoder) { Set-Status 'Ready - drop video files into the window' $true }
-    else { Set-Status 'No encoder selected - open Settings' }
+    else { Set-Status 'Set encoder ->' }
 }
 function Fmt-Num([double]$Value) { return $Value.ToString('0.####', [Globalization.CultureInfo]::InvariantCulture) }
 function Get-VideoControllers {
@@ -2113,7 +2113,7 @@ foreach ($it in $cmb_encoder.Items) { if ($it.Tag) { $foundCount++; Add-Log ('En
 if ($foundCount -gt 0) { $lbl_gpu.Text += ('  |  ' + $foundCount + ' encoder(s) found') }
 else {
     Add-Log 'No encoder found. Looked for NVEncC64.exe / VCEEncC64.exe / QSVEncC64.exe in the script folder, the current folder and PATH. Open Settings > ENCODER to browse for an encoder.'
-    $lbl_gpu.Text += '  |  no encoder found - open Settings'
+    $lbl_gpu.Text += '  |  Encoder not found'
 }
 
 # ------------------------------------------------------------ events
