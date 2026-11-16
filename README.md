@@ -12,6 +12,11 @@ A Powershell GUI inspired by Stuart Cameron's [VapourBox](https://github.com/Stu
 
 ## Screenshot
 
-<img width="100%" alt="VPPBox" src="https://github.com/user-attachments/assets/9390d784-f967-4b1b-899d-45b7b345dbb0" />
+<img width="100%" alt="VPPBox" src="https://github.com/user-attachments/assets/a2084c8a-2a40-4717-99ef-a2d3f35147a0" />
+
+## Run
+
+powershell -ExecutionPolicy Bypass -File VPPBox.ps1
+
 
 
